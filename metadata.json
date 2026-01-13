@@ -1,0 +1,5 @@
+{
+  "name": "Encephalitis Content Classifier",
+  "description": "A Gemini-powered AI Data Engineer tool to parse sitemaps, scrape content, and classify pages into a structured taxonomy for Encephalitis International.",
+  "requestFramePermissions": []
+}
