@@ -43,14 +43,13 @@ const taxonomySchema: Schema = {
   required: ["title", "summary", "tags"],
 };
 
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const classifyPageContent = async (
   url: string,
   pageText: string
 ): Promise<ClassifiedPage> => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) throw new Error("API Key is missing.");
-
-  const ai = new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   const prompt = `
     Analyze the following website content from URL: ${url}.
@@ -61,31 +60,55 @@ export const classifyPageContent = async (
     ${pageText.substring(0, 20000)}
   `;
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview", // Efficient for high volume classification
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: taxonomySchema,
-        systemInstruction: `You are the AI Data Engineer for Encephalitis International. 
+  const MAX_RETRIES = 5;
+  let attempt = 0;
+  let delay = 5000; // Start with 5 seconds for rate limit backoff
+
+  while (true) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview", // Efficient for high volume classification
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: taxonomySchema,
+          systemInstruction: `You are the AI Data Engineer for Encephalitis International. 
         You strictly follow the provided taxonomy.
         Prefix tags with their category name (e.g., 'persona:caregiver', 'stage:acute_hospital').
         If a category is not applicable, leave the array empty.
         Be precise.`,
-      },
-    });
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("Empty response from Gemini");
+      const text = response.text;
+      if (!text) throw new Error("Empty response from Gemini");
 
-    const result = JSON.parse(text);
-    return {
-      url,
-      ...result,
-    };
-  } catch (error) {
-    console.error("Gemini Classification Error:", error);
-    throw error;
+      const result = JSON.parse(text);
+      return {
+        url,
+        ...result,
+      };
+    } catch (error: any) {
+      // Check for Rate Limit (429) or Resource Exhausted errors
+      const isRateLimit = 
+        error?.status === 429 || 
+        error?.code === 429 || 
+        (error?.message && (
+          error.message.includes("429") || 
+          error.message.includes("RESOURCE_EXHAUSTED") ||
+          error.message.includes("quota")
+        ));
+
+      if (isRateLimit && attempt < MAX_RETRIES) {
+        console.warn(`Rate limit hit for ${url}. Retrying in ${delay / 1000}s... (Attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await wait(delay);
+        attempt++;
+        delay *= 2; // Exponential backoff: 5s -> 10s -> 20s...
+        continue;
+      }
+
+      console.error("Gemini Classification Error:", error);
+      throw error;
+    }
   }
 };
