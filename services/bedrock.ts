@@ -11,18 +11,121 @@ export interface AwsConfig {
   modelId?: string;
 }
 
+// Cache for exchanged credentials to avoid hitting the pre-signed URL repeatedly for every page
+let cachedCreds: {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  expiration: number;
+} | null = null;
+
 // Helper: Sanitize inputs
 const sanitize = (val: string | undefined): string => {
   if (!val) return '';
   return val.trim();
 };
 
-// Helper: Parse credentials from a single string (API Key field)
-// Supports:
-// 1. Base64 encoded "key:secret" or "key:secret:sessionToken"
-// 2. Raw "key:secret" or "key:secret:sessionToken"
-// 3. JSON object { accessKeyId, secretAccessKey, sessionToken }
-const parseCredentialsFromApiKey = (apiKey: string) => {
+/**
+ * Exchanges the "bedrock-api-key-" formatted string for temporary AWS credentials.
+ * The key is essentially a base64 encoded pre-signed URL that returns credentials when fetched.
+ * Uses CORS proxies to bypass browser restrictions on fetching AWS endpoints directly.
+ */
+const exchangeHackathonKey = async (apiKey: string) => {
+  // Return cached creds if valid (buffer of 5 mins)
+  if (cachedCreds && cachedCreds.expiration > Date.now() + 5 * 60 * 1000) {
+    return cachedCreds;
+  }
+
+  const cleanKey = sanitize(apiKey);
+  const prefix = "bedrock-api-key-";
+  
+  if (!cleanKey.startsWith(prefix)) {
+    throw new Error("Invalid Hackathon Key format. Expected start with 'bedrock-api-key-'");
+  }
+
+  const base64Part = cleanKey.slice(prefix.length);
+  let decodedUrl = "";
+  try {
+    decodedUrl = atob(base64Part);
+  } catch (e) {
+    throw new Error("Failed to decode Hackathon Key (Base64 invalid).");
+  }
+
+  // Ensure it has protocol
+  if (!decodedUrl.startsWith("http")) {
+    decodedUrl = `https://${decodedUrl}`;
+  }
+
+  // Define strategies to fetch the credentials URL (Proxy vs Direct)
+  const strategies = [
+    // Primary: CorsProxy.io (Handling the AWS URL query params correctly)
+    async (target: string) => {
+       const res = await fetch(`https://corsproxy.io/?${encodeURIComponent(target)}`);
+       if (!res.ok) throw new Error(`Proxy 1 HTTP ${res.status}`);
+       return res.json();
+    },
+    // Fallback: AllOrigins
+    async (target: string) => {
+       const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`);
+       if (!res.ok) throw new Error(`Proxy 2 HTTP ${res.status}`);
+       return res.json();
+    },
+    // Fallback: Direct (Likely fails CORS, but here for completeness)
+    async (target: string) => {
+       const res = await fetch(target);
+       if (!res.ok) throw new Error(`Direct HTTP ${res.status}`);
+       return res.json();
+    }
+  ];
+
+  let data = null;
+  let lastError = "";
+
+  for (const strategy of strategies) {
+    try {
+      data = await strategy(decodedUrl);
+      if (data) break;
+    } catch (e: any) {
+      console.warn("Key Exchange Strategy failed:", e.message);
+      lastError = e.message;
+    }
+  }
+
+  if (!data) {
+    throw new Error(`Key Exchange Failed. Unable to fetch credentials via proxies. Last error: ${lastError}`);
+  }
+
+  try {
+    // Validate response structure (AWS usually returns capitalized keys, but we check both)
+    const accessKeyId = data.AccessKeyId || data.accessKeyId;
+    const secretAccessKey = data.SecretAccessKey || data.secretAccessKey;
+    const sessionToken = data.SessionToken || data.sessionToken;
+    const expirationStr = data.Expiration || data.expiration;
+
+    if (!accessKeyId || !secretAccessKey || !sessionToken) {
+      throw new Error("Invalid response from Key Exchange: Missing credentials fields.");
+    }
+
+    const expiration = expirationStr ? new Date(expirationStr).getTime() : Date.now() + 3600 * 1000; // Default 1h
+
+    const credentials = {
+      accessKeyId,
+      secretAccessKey,
+      sessionToken,
+      expiration
+    };
+
+    cachedCreds = credentials;
+    return credentials;
+
+  } catch (err: any) {
+    console.error("Hackathon Key Parsing Error:", err);
+    throw new Error(`Failed to parse credentials from key exchange: ${err.message}`);
+  }
+};
+
+// Helper: Parse credentials from a single string (Standard/Legacy formats)
+const parseStandardCredentials = (apiKey: string) => {
   const clean = sanitize(apiKey);
   if (!clean) return null;
 
@@ -40,18 +143,12 @@ const parseCredentialsFromApiKey = (apiKey: string) => {
     } catch (e) { /* Not JSON */ }
   }
 
-  // 2. Try Base64 decoding
+  // 2. Try Base64 decoding (legacy user:pass)
   let decoded = clean;
-  let isBase64 = false;
   try {
-    // Check if it looks like base64 (alphanumeric + +/=)
-    if (/^[a-zA-Z0-9+/=]+$/.test(clean)) {
+    if (/^[a-zA-Z0-9+/=]+$/.test(clean) && !clean.includes(' ')) {
         const d = atob(clean);
-        // Valid credential string usually contains a colon
-        if (d.includes(':')) {
-            decoded = d;
-            isBase64 = true;
-        }
+        if (d.includes(':')) decoded = d;
     }
   } catch (e) { /* Not Base64 */ }
 
@@ -62,7 +159,6 @@ const parseCredentialsFromApiKey = (apiKey: string) => {
     const secretAccessKey = parts[1].trim();
     const sessionToken = parts.length > 2 ? parts.slice(2).join(':').trim() : undefined;
 
-    // Basic validation: AWS Access Keys (AKIA/ASIA) are usually 20 chars
     if (accessKeyId.length >= 16 && secretAccessKey.length > 10) {
         return { accessKeyId, secretAccessKey, sessionToken };
     }
@@ -71,32 +167,24 @@ const parseCredentialsFromApiKey = (apiKey: string) => {
   return null;
 };
 
-// Helper: Call Bedrock using Standard IAM Credentials via AWS SDK
+// Helper: Call Bedrock using IAM Credentials via AWS SDK
 const invokeBedrockWithIam = async (
   prompt: string,
   config: AwsConfig,
-  overrides?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string }
+  creds: { accessKeyId: string; secretAccessKey: string; sessionToken?: string }
 ): Promise<string> => {
-  const accessKeyId = overrides?.accessKeyId || sanitize(config.accessKeyId);
-  const secretAccessKey = overrides?.secretAccessKey || sanitize(config.secretAccessKey);
-  const sessionToken = overrides?.sessionToken || sanitize(config.sessionToken);
-  const region = config.region?.trim() || 'us-east-1';
-  const modelId = config.modelId?.trim() || "us.anthropic.claude-3-haiku-20240307-v1:0";
-
-  if (!accessKeyId || !secretAccessKey) {
-     throw new Error("AWS Credentials missing. Please check your configuration.");
-  }
+  const region = config.region?.trim() || 'us-west-2';
+  const modelId = config.modelId?.trim() || "global.anthropic.claude-haiku-4-5-20251001-v1:0";
 
   const client = new BedrockRuntimeClient({
     region,
     credentials: { 
-        accessKeyId, 
-        secretAccessKey,
-        sessionToken: sessionToken || undefined
+        accessKeyId: creds.accessKeyId, 
+        secretAccessKey: creds.secretAccessKey,
+        sessionToken: creds.sessionToken
     }
   });
 
-  // Native Anthropic Payload for InvokeModel
   const payload = {
     anthropic_version: "bedrock-2023-05-31",
     max_tokens: 4096,
@@ -127,9 +215,8 @@ const invokeBedrockWithIam = async (
         throw new Error(`Model ID Error: ${msg}. Please select a 'us.' or 'global.' prefixed model in Settings.`);
      }
      if (err.name === 'UnrecognizedClientException' || err.name === 'AccessDeniedException' || msg.includes('403')) {
-        throw new Error(`Authentication Failed (${err.name}). 1) Check your Access Key/Secret. 2) Check if your Region (${region}) matches your key. 3) If using temporary keys, ensure Session Token is provided and not expired.`);
+        throw new Error(`Authentication Failed (${err.name}). Check your Region (${region}) or Key validity.`);
      }
-     
      throw err;
   }
 };
@@ -172,25 +259,38 @@ export const classifyWithBedrock = async (
   `;
 
   let jsonString = "";
+  let credentials;
 
   try {
     if (config.authType === 'apikey' && config.apiKey) {
-      // Parse the "API Key" field into actual AWS Credentials
-      const creds = parseCredentialsFromApiKey(config.apiKey);
+      const cleanApiKey = sanitize(config.apiKey);
       
-      if (creds) {
-        jsonString = await invokeBedrockWithIam(prompt, config, creds);
+      if (cleanApiKey.startsWith('bedrock-api-key-')) {
+         // Hackathon 2026 Key Exchange Flow
+         credentials = await exchangeHackathonKey(cleanApiKey);
       } else {
-        // Fallback or Error: We do NOT support Bearer token fetch against AWS Bedrock directly 
-        // because it requires SigV4. If parsing fails, the key is invalid for this app.
-        throw new Error("Invalid API Key format. Expected 'AccessKey:SecretKey' (Raw or Base64) or a JSON credential object.");
+         // Standard Manual/Legacy Parse
+         credentials = parseStandardCredentials(cleanApiKey);
+         if (!credentials) {
+            throw new Error("Invalid API Key format. For the Hackathon, ensure the key starts with 'bedrock-api-key-' and has no spaces. For manual keys, use 'AccessKey:SecretKey'.");
+         }
       }
     } else {
-      // Standard IAM Inputs
-      jsonString = await invokeBedrockWithIam(prompt, config);
+      // Standard IAM Tab Inputs
+      if (!config.accessKeyId || !config.secretAccessKey) {
+        throw new Error("Missing AWS Credentials in Standard configuration.");
+      }
+      credentials = {
+        accessKeyId: sanitize(config.accessKeyId),
+        secretAccessKey: sanitize(config.secretAccessKey),
+        sessionToken: sanitize(config.sessionToken) || undefined
+      };
     }
 
-    // Clean up potential markdown blocks if the model adds them
+    if (!credentials) throw new Error("Could not resolve AWS credentials.");
+
+    jsonString = await invokeBedrockWithIam(prompt, config, credentials);
+
     if (!jsonString) throw new Error("Empty response from Bedrock model");
     
     const cleanJson = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -203,11 +303,7 @@ export const classifyWithBedrock = async (
 
   } catch (error) {
     console.error("AWS Bedrock Classification Error:", error);
-    
-    // Pass through readable errors
-    if (error instanceof Error) {
-        throw error;
-    }
+    if (error instanceof Error) throw error;
     throw new Error("Unknown Bedrock Error");
   }
 };

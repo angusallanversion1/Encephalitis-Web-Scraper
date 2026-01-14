@@ -56,7 +56,7 @@ const formatTime = (ms: number): string => {
 const STORAGE_KEY = 'encephalitis_classifier_session_v1';
 const PROVIDER_KEY = 'encephalitis_classifier_provider';
 // Bump version to reset config for new model options and region fix
-const AWS_CONFIG_KEY = 'encephalitis_classifier_aws_config_v8';
+const AWS_CONFIG_KEY = 'encephalitis_classifier_aws_config_v9';
 
 type AiProvider = 'gemini' | 'bedrock';
 
@@ -77,7 +77,7 @@ export default function App() {
     secretAccessKey: '',
     sessionToken: '',
     apiKey: '',
-    region: 'us-east-1', 
+    region: 'us-west-2', // Defaulting to Oregon as requested
     modelId: 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
   });
   
@@ -471,23 +471,23 @@ export default function App() {
                    <div className="space-y-4 animate-in fade-in duration-300">
                       <div className="bg-orange-50 p-3 rounded-lg border border-orange-100 text-xs text-orange-800 flex gap-2">
                         <HelpCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                        <p>
-                          Enter your credential string. Supports:
-                          <ul className="list-disc pl-4 mt-1 space-y-1">
-                             <li>Base64 string (provided by events)</li>
+                        <div className="text-left">
+                          <p className="font-semibold mb-1">Supported Formats:</p>
+                          <ul className="list-disc pl-4 space-y-1">
+                             <li><code>bedrock-api-key-...</code> (Auto-exchange for creds)</li>
                              <li>Raw <code>AccessKey:SecretKey</code></li>
-                             <li>Raw <code>AccessKey:SecretKey:SessionToken</code></li>
+                             <li>Legacy Base64 encoded keys</li>
                           </ul>
-                        </p>
+                        </div>
                       </div>
                       <div>
-                        <label className="block text-xs font-bold text-slate-700 uppercase mb-1">Key String</label>
+                        <label className="block text-xs font-bold text-slate-700 uppercase mb-1">Hackathon Key</label>
                         <input 
                           type="text" 
                           value={awsConfig.apiKey}
                           onChange={e => setAwsConfig({...awsConfig, apiKey: e.target.value})}
                           className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none font-mono"
-                          placeholder="Paste encoded string or key:secret..."
+                          placeholder="Paste bedrock-api-key-... string here"
                           required={awsConfig.authType === 'apikey'}
                         />
                       </div>
@@ -542,8 +542,8 @@ export default function App() {
                         onChange={e => setAwsConfig({...awsConfig, region: e.target.value})}
                         className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none bg-white"
                       >
-                        <option value="us-east-1">US East (N. Virginia)</option>
                         <option value="us-west-2">US West (Oregon)</option>
+                        <option value="us-east-1">US East (N. Virginia)</option>
                         <option value="eu-central-1">Europe (Frankfurt)</option>
                         <option value="ap-northeast-1">Asia Pacific (Tokyo)</option>
                       </select>
